@@ -108,66 +108,92 @@ The final output of this step is a tabular feature matrix where each row corresp
 
 ### 4.2 Normal-Only AutoEncoder Anomaly Detection
 
-The AutoEncoder is trained only on normal training samples. The normal training feature matrix is split into:
+The AutoEncoder is trained only on normal training samples. For each machine type, the `_thr.xlsx` file is treated as the normal-only training feature matrix. This matrix is split into:
 
-- normal training subset,
-- normal validation/calibration subset.
+* normal training subset,
+* normal validation/calibration subset.
 
-Preprocessing is fitted only on the normal training subset:
+Preprocessing is fitted only on the normal training subset. The preprocessing pipeline consists of:
 
-- median imputation,
-- standard scaling.
+* median imputation,
+* robust scaling,
+* clipping of extreme scaled values.
 
-The validation subset is used for score calibration and threshold estimation. Evaluation/test samples are never used during training or calibration.
+Robust scaling is preferred because the extracted TDA descriptors may contain heavy-tailed feature distributions. After scaling, feature values are clipped to reduce the influence of extreme transformed values and to stabilize AutoEncoder training.
 
-### 4.3 Selected AE Structure
+The validation subset is used only for normal-based score calibration. Evaluation/test samples are never used for AE training. Test labels are not used at any stage.
 
-Development experiments showed that different machine types benefit from different AE scoring mechanisms. Therefore, the final approach uses a dev-guided multi-branch AE ensemble rather than a single AE score.
+### 4.3 Improved AE Structure
+
+The final method uses a normal-only multi-branch AutoEncoder ensemble. The purpose of the ensemble is to combine complementary anomaly evidence from latent-space structure and reconstruction behavior.
+
+Compared with the initial AE version, the improved version uses:
+
+* smaller AE capacity,
+* Gaussian denoising,
+* sparse latent regularization,
+* Layer Normalization instead of Batch Normalization,
+* linear latent representations,
+* Huber reconstruction loss,
+* multiple random seeds for score stabilization.
 
 The final ensemble contains three AE branches:
 
-1. **Compact sparse latent AE**
-   - latent dimension: 4
-   - noise: 0.0
-   - sparse activity regularization: \(10^{-5}\)
-   - main score: latent-space kNN percentile score
+1. Small sparse latent AE
 
-2. **Sparse denoising AE**
-   - latent dimension: 16
-   - Gaussian noise: 0.03
-   - sparse activity regularization: \(10^{-5}\)
-   - main scores: top-k reconstruction deviation and z-mean deviation
+   * latent dimension: 4
+   * Gaussian noise: 0.05
+   * sparse activity regularization: \(10^{-4}\)
+   * hidden structure: `input_dim -> 64 -> 32 -> latent_dim -> 32 -> 64 -> input_dim`
+   * main scores: latent-space kNN and latent-space Mahalanobis scores
 
-3. **Reconstruction-oriented AE**
-   - latent dimension: 8
-   - Gaussian noise: 0.03
-   - sparse activity regularization: 0.0
-   - main scores: MSE and MAE reconstruction percentiles
+2. Denoising latent AE
 
-Each branch follows the encoder-decoder structure:
+   * latent dimension: 8
+   * Gaussian noise: 0.08
+   * sparse activity regularization: \(10^{-5}\)
+   * hidden structure: `input_dim -> 64 -> 32 -> latent_dim -> 32 -> 64 -> input_dim`
+   * main scores: top-k absolute reconstruction deviation and reliability-weighted absolute reconstruction deviation
 
-```text
-input_dim -> 128 -> 64 -> latent_dim -> 64 -> 128 -> input_dim
-```
+3. Reconstruction-oriented AE
 
-with ReLU activation, batch normalization, dropout, and L2 kernel regularization.
+   * latent dimension: 16
+   * Gaussian noise: 0.10
+   * sparse activity regularization: 0.0
+   * hidden structure: `input_dim -> 96 -> 48 -> latent_dim -> 48 -> 96 -> input_dim`
+   * main scores: MSE, MAE, and global absolute robust reconstruction deviation
+
+Each branch is trained only on normal samples. The final anomaly ranking is obtained by combining the selected score components from all branches.
 
 ### 4.4 Final Score Fusion
 
-Raw anomaly scores are converted into percentile scores using the normal validation score distribution. The final anomaly score is computed as:
+The improved scoring strategy does not assume that anomalies must always have larger reconstruction errors or larger latent distances. In some target-domain cases, anomalous samples may also produce unusually low reconstruction or latent-distance values. Therefore, the final method uses a two-sided robust scoring strategy.
 
-```text
-final_score =
-    0.45 * latent_knn_pct
-  + 0.30 * topk_zmean_pct
-  + 0.10 * zmean_pct
-  + 0.10 * mse_pct
-  + 0.05 * mae_pct
-```
+For each raw score component, the method computes a robust deviation from the normal validation distribution. Both unusually high and unusually low deviations can contribute to the anomaly score. The calibrated component score combines:
 
-The decision threshold is estimated from the 95th percentile of the final validation-normal score distribution. The continuous anomaly score is used for AUC-based evaluation, while the thresholded score is used to create the decision file.
+* percentile position with respect to the normal validation score distribution,
+* rank normalization within the evaluated test set.
 
----
+The final anomaly score is computed as a weighted ensemble:
+
+    final_score =
+        0.30 * latent_knn_pct
+      + 0.15 * latent_mahalanobis_pct
+      + 0.25 * topk_zabsmean_pct
+      + 0.10 * weighted_zabsmean_pct
+      + 0.10 * mse_pct
+      + 0.05 * mae_pct
+      + 0.05 * zabsmean_pct
+
+To reduce sensitivity to random AE initialization, the final system trains the AE ensemble using multiple random seeds and averages the rank-normalized anomaly scores. The resulting continuous score is written to the official anomaly-score file:
+
+    anomaly_score_{MachineType}_section_00_test.csv
+
+The binary decision file is generated separately from the continuous score. In the current implementation, the top half of the test samples according to the final anomaly score are labeled as anomalous, which matches the balanced DCASE-style evaluation setting with 200 test samples per machine section.
+
+    decision_result_{MachineType}_section_00_test.csv
+
+The official AUC-based evaluation mainly depends on the continuous anomaly-score ranking, while the decision file is used for threshold-based metrics such as precision, recall, and F1 score.
 
 ## 5. Output Format
 
